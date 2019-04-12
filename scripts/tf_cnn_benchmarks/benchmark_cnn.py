@@ -60,6 +60,8 @@ from tensorflow.python.ops import data_flow_ops
 from tensorflow.python.platform import gfile
 from tensorflow.python.util import nest
 
+import argon_api  # pylint: disable=import-error
+from nrv_test.argon import get_ar_state, argon_enum_from_name
 
 _DEFAULT_NUM_BATCHES = 100
 
@@ -665,6 +667,43 @@ flags.DEFINE_string('benchmark_test_id', None,
 
 platforms_util.define_platform_params()
 
+g_argon = None
+from threading import Thread, Lock
+ar_mutex = Lock()
+#from mpi4py import MPI
+#g_comm = MPI.COMM_WORLD
+
+def argon_init(rank):
+    global g_argon
+    if g_argon == None:
+      print("!!!CHANDAN: argon is None")
+      g_argon = get_ar_state([rank])
+
+def argon_allreduce(t_data, rank):
+  ar_mutex.acquire()
+  try:
+      argon_init(rank)
+
+      #t_data1 = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], np.float32)
+      #print("!!!CHANDAN: before argon_allreduce: rank: {}, t_data.shape: {}".format(rank, t_data.shape))
+      org_shape = t_data.shape
+      t_data = np.reshape(t_data, (t_data.shape[0], -1))
+
+      #print("!!!CHANDAN: after argon_allreduce: rank: {}, t_data.shape: {}".format(rank, t_data.shape))
+      g_argon.backend.begin(g_argon.Block.minibatch, 1)
+      data_type = argon_enum_from_name(g_argon, 'AR_DATA_TYPE_FLOAT32') #TODO get data type from tensor?
+      input_tensor = g_argon.backend.array(t_data, np.float32, tensor_data_type=data_type)
+      output_tensor = g_argon.backend.empty(
+        shape=t_data.shape, tensor_data_type=data_type)  #TODO shape
+      g_argon.backend.allReduce(input_tensor, output_tensor, argon_api.AR_COMMS_REDUCTION_SUM)
+      ar_data = output_tensor.get()
+      g_argon.backend.end(g_argon.Block.minibatch, 1)
+      #print("!!!CHANDAN: ar_data.shape: {} g_comm.rank: {}".format(ar_data.shape, g_comm.Get_rank()))
+      t_data = np.reshape(ar_data, (org_shape))
+      #g_comm.Barrier()
+      return t_data
+  finally:
+    ar_mutex.release()
 
 class GlobalStepWatcher(threading.Thread):
   """A helper class for global_step.
@@ -3249,9 +3288,28 @@ class BenchmarkCNN(object):
           horovod_device = '/%s:0' % self.params.horovod_device
         else:
           horovod_device = ''
+
         # All-reduce gradients using Horovod.
-        grads = [hvd.allreduce(grad, average=False, device_dense=horovod_device)
-                 for grad in grads]
+        print("!!!CHANDAN: rank {}".format(hvd.rank()))
+        pred = None
+        for i in range(0, len(grads), 1):
+          grad = grads[i]
+          import re
+          if re.search("batch.*norm", params[i].name, re.IGNORECASE) != None:
+              grads[i] = grad
+          else:
+            #grads[i] = hvd.allreduce(grad, average=False, device_dense=horovod_device)
+            if i > 0:
+              with tf.control_dependencies([pred]):
+                grad = tf.contrib.eager.py_func(func=argon_allreduce, inp=[grad, hvd.rank()], Tout=grad.dtype)
+            else:
+              grad = tf.contrib.eager.py_func(func=argon_allreduce, inp=[grad, hvd.rank()], Tout=grad.dtype)
+
+            pred = grad
+            grads[i] = grad
+
+        #grads = [hvd.allreduce(grad, average=False, device_dense=horovod_device)
+        #         for grad in grads]
 
       if self.params.staged_vars:
         grad_dtypes = [grad.dtype for grad in grads]
